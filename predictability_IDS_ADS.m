@@ -1,0 +1,635 @@
+% Scripts used to test intonation (F0) predictability on ManyBabies data 
+% (The ManyBabies Consortium, 2017; https://osf.io/re95x/)
+% as reported in Rasanen, O. Kakouros, S. & Soderstrom, M. (submitted): 
+% Connecting stimulus-driven attention to the properties of infant-directed
+% speech ? Is exaggerated intonation also more surprising?". 
+%
+% Note: requires YAAPT (Zahorian & Hu, 2008;
+% http://ws2.binghamton.edu/zahorian/yaapt.htm) for F0 estimation. 
+% Version 4.0 was used for the results reported in the manuscript.
+%
+% Code by Okko Rasanen (okko.rasanen@aalto.fi). Last update: 27.1.2017
+
+clear all
+
+% Parameters
+
+polyorder = 1; % order of the polynomial fit to F0 tracks (1 or 2).
+Q_values = [6,12,24]; % codebook sizes used for F0 track quantization
+total_folds = 10; % how many folds to use in training/testing (default 10)
+n_repeats = 5;    % how many times the experiment is repeated and averaged
+mocm_order = 3; % order of the mixed-order Markov chain model (default = 3)
+
+% Get location of the current scripts
+
+tmp = which('loadManyBabiesData');
+[curdir,b,c] = fileparts(tmp);
+addpath([curdir '/thetaOscillator']);
+addpath([curdir '/MixedOrderMarkov']);
+addpath([curdir '/aux']);
+
+% Get metadata and filenames for the signals
+[METADATA,filenames,METADATA_HEADERS] = loadManyBabiesData();
+
+% Extract F0 with YAAPT (if not already done before)
+
+F0_filename = [curdir '/saves/F0_trajectories_and_metadata.mat'];
+if(~exist(F0_filename,'file'))
+    F0_raw = cell(length(filenames),1);
+    
+    for k = 1:length(filenames)
+        [x,fs] = audioread(filenames{k});
+        
+        x = resample(x,16000,fs);
+        fs = 16000;
+        
+        ExtrPrm.f0_min = 100;   % Limit low F0 to 100 Hz
+        ExtrPrm.f0_max = 600;   % Set max F0 to 600 Hz
+        [F0_raw{k}, numfrms, frmrate] = yaapt(x, fs,1,ExtrPrm,0,1);
+        
+        procbar(k,length(filenames));
+    end
+    
+    save(F0_filename,'F0_raw','METADATA','filenames','METADATA_HEADERS');
+else
+    load(F0_filename,'F0_raw','METADATA','filenames','METADATA_HEADERS');
+end
+
+% Remove utterances shorter than 1 sec (YAAPT output is 100 Hz).
+utterance_lengths = cellfun(@length,F0_raw);
+a = find(utterance_lengths < 100);
+
+F0_raw(a) = [];
+METADATA(a,:) = [];
+filenames(a) = [];
+N = length(F0_raw);
+
+% Do sonority-based syllabification with algorithm described in Rasanen,
+% Doyle & Frank (submitted). Included in the package
+
+syllable_filename = [curdir '/saves/syllables.mat'];
+if(~exist(syllable_filename,'file'))
+    [bounds,bounds_t,osc_env,nuclei] = thetaseg(filenames);
+    save(syllable_filename,'bounds','bounds_t','osc_env','nuclei');
+else
+    load(syllable_filename,'bounds','bounds_t','osc_env','nuclei');
+end
+
+% Clean syllables without sensible pitch estimates
+% (must have non-zero change across time) and syllables shorter than 50 ms.
+
+for k = 1:N
+    toremove = [];
+    for j = 2:length(bounds{k})
+        b1 = max(1,round(bounds_t{k}(j-1)*100));
+        b2 = round(bounds_t{k}(j)*100);
+        fy = F0_raw{k}(b1:min(b2,length(F0_raw{k})));
+        
+        if(sum(abs(diff(fy))) == 0 )
+            toremove = [toremove;j];
+        end
+    end
+    
+    bounds{k}(toremove) = [];
+    bounds_t{k}(toremove) = [];
+    
+    tmp = diff(bounds_t{k});
+    a = find(tmp < 0.05);
+    bounds_t{k}(a+1) = [];
+    bounds{k}(a+1) = [];
+end
+
+
+% Run YAAPT pitch fix and unvoiced interpolation using the following
+% settings (edit to ptch_fix or change the command file)
+%
+% pitch_half = 2;
+% pitch_half_sens = 3;
+% pitch_double = 2;
+% pitch_double_sens = 3.5;
+% interp = 1;
+% smooth_factor = 5;
+% smooth = 0;
+% extrap = 1;
+% ptch_typ = 100;
+
+for k = 1:N
+    F0_raw{k} = ptch_fix(F0_raw{k});
+end
+
+F0_raw_orig = F0_raw; % Store original absolute F0 values in Hz
+
+%
+for k = 1:N
+    F0_raw{k} = F0_raw{k}';
+    F0_raw{k} = medfilt1(F0_raw{k},4); % apply 4 point median filter to smooth local errors
+    F0_raw{k}(1) = F0_raw{k}(2);   % Fix the first sample messed by medfilt.
+end
+
+% Z-score normalize all features
+
+for k = 1:N
+    F0_raw{k} = F0_raw{k}-mean(F0_raw{k});
+    F0_raw{k} = F0_raw{k}./std(F0_raw{k});
+end
+
+
+
+F0PARAMS = cell(N,1);
+CONCAT = cell(N,1);
+
+for k = 1:N
+    F0PARAMS{k} = zeros(1,polyorder);
+    CONCAT{k} = zeros(size(F0_raw{k}));
+    
+    counter = 1;
+    
+    for j = 2:length(bounds{k})
+        b1 = max(1,round(bounds_t{k}(j-1)*100));
+        b2 = round(bounds_t{k}(j)*100);
+        
+        fy = F0_raw{k}(b1:min(b2,length(F0_raw{k})));
+        
+        a = polyfit((1:length(fy))',fy,polyorder);
+        
+        if(sum(abs(diff(fy))) > 0)
+            F0PARAMS{k}(counter,:) = a(1:polyorder);
+            counter = counter+1;
+        end
+        
+        % Create also concatenation of the syllable-wise F0 fits for
+        % visualization purposes.
+        
+        x = (1:(b2-b1+1))';
+        if(polyorder == 2)
+            y = a(1).*x.^2+a(2).*x+a(3);
+        else
+            y = a(1).*x+a(2);
+        end
+        CONCAT{k}(b1:b2) = y;
+    end
+end
+
+% Remove utterances with less than 5 syllables.
+syls_per_utterance = cellfun(@length,F0PARAMS);
+a = find(syls_per_utterance < 5);
+
+F0_raw(a) = [];
+F0_raw_orig(a) = [];
+F0PARAMS(a) = [];
+osc_env(a) = [];
+bounds(a) = [];
+bounds_t(a) = [];
+METADATA(a,:) = [];
+filenames(a) = [];
+CONCAT(a) = [];
+N = length(F0_raw);
+
+F0prob = cell(N,1);
+totrain = floor((1-1/total_folds)*N);
+counts = zeros(N,1); % counter for the number of prob. sums per utterance
+
+for iter = 1:n_repeats    
+    % Randomize the order of the utterances for each repeat of the
+    % experiment
+    rng(123+iter,'twister');
+    allinds = (1:N)';
+    allinds = allinds(randperm(length(allinds)));
+    
+    for fold = 1:total_folds
+        fprintf('Experiment %d out of %d. Fold %d out of %d.\n',iter,n_repeats,fold,total_folds);
+        traininds = allinds(1:totrain);
+        testinds = allinds(totrain+1:end);
+        
+        % Combine all training F0 into one long signal (random order between utterances)
+        allf0 = zeros(sum(cellfun(@length,F0PARAMS(traininds))),size(F0PARAMS{1},2));
+        orderi = randperm(N);
+        wloc = 1;
+        for j = 1:length(traininds)
+            k = traininds(j);
+            len = length(F0PARAMS{orderi(k)});
+            allf0(wloc:wloc+len-1,:) = F0PARAMS{orderi(k)};
+            wloc = wloc+len;
+        end
+        
+        % Quantize individual utterances 
+        
+        for Q = Q_values
+            fprintf('Codebook size %d.\n',Q);
+            [data_q,centroids] = kmeans(allf0,Q);
+            F0_Q = cell(size(F0PARAMS));
+            for k = 1:length(F0PARAMS)
+                if(~isempty(F0PARAMS{k}))
+                    if(size(F0PARAMS{k},2) > 2)
+                        F0PARAMS{k} = F0PARAMS{k}';
+                    end
+                    d = pdist2(F0PARAMS{k},centroids);
+                    [~,F0_Q{k}] = min(d,[],2);
+                end
+            end
+            
+            % Train mixed-order Markov chain model on the training data
+            [M,lambda] = getMixedOrderModel(data_q,mocm_order,15);
+            
+            % Get F0 likelihoods on the test utterances
+            for j = 1:length(testinds)
+                k = testinds(j);
+                if(~isempty(F0prob{k}))
+                    F0prob{k} = F0prob{k}+getSeqLikelihood(F0_Q{k},M,lambda);
+                    counts(k) = counts(k)+1;
+                else
+                    F0prob{k} = getSeqLikelihood(F0_Q{k},M,lambda);
+                    counts(k) = counts(k)+1;
+                end
+            end
+        end
+        % Rotate training/testing sets between folds by 1/foldsize
+        allinds = circshift(allinds,length(testinds));
+    end
+end
+
+% Remove leading mocm_order-1 zeros from likelihoods and divide by the
+% number of additions across the repeats.
+
+for k = 1:N
+    if(~isempty(F0prob{k}))
+        F0prob{k} = F0prob{k}(mocm_order+1:end);
+        F0prob{k} = F0prob{k}./counts(k);
+    end
+end
+
+result_filename = sprintf('%s/results/results_%s.mat',curdir,datestr(now));
+save(result_filename,'F0prob','F0_raw_orig','METADATA','F0_raw','F0PARAMS','osc_env','bounds','bounds_t','filenames','N');
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Part 2: Analyze results
+
+% Get utterance-level descriptors for probabilities and original F0
+durs = cellfun(@length,F0_raw_orig)./100;
+
+ids_i = cellfind(METADATA(:,1),'IDS');
+ads_i = cellfind(METADATA(:,1),'ADS');
+
+% probs
+all_SD = cellfun(@nanstd,F0prob);
+all_mean = cellfun(@nanmean,F0prob);
+all_max = cellfun(@nanmax,F0prob);
+all_min = cellfun(@nanmin,F0prob);
+all_maxmin = cellfun(@nanmax,F0prob)-cellfun(@nanmin,F0prob);
+
+% raw F0 in Hz
+all_var_orig = cellfun(@nanstd,F0_raw_orig);
+all_mean_orig = cellfun(@nanmean,F0_raw_orig);
+all_min_orig = cellfun(@nanmin,F0_raw_orig);
+all_max_orig = cellfun(@nanmax,F0_raw_orig);
+all_maxmin_orig = cellfun(@nanmax,F0_raw_orig)-cellfun(@nanmin,F0_raw_orig);
+
+id_labels = zeros(length(durs),1);
+id_labels(ads_i) = 1;
+id_labels(ids_i) = 2;
+
+subject_labels = str2num(strvcat(METADATA(:,2)));
+UTT_STATS = [id_labels all_SD all_mean all_max all_min all_maxmin all_var_orig all_mean_orig all_max_orig all_min_orig all_maxmin_orig log(durs) str2num(strvcat(METADATA(:,2)))];
+
+% Get subject means for all descriptors
+uq_subjects = unique(subject_labels);
+utterance_lengths = cellfun(@length,F0prob);
+SUBJ_STATS = zeros(length(uq_subjects)*2,size(UTT_STATS,2));
+am_data = zeros(length(uq_subjects).*2,1);
+n_utt_per_talker = zeros(length(uq_subjects),1);
+n = 1;
+for s = 1:length(uq_subjects)
+    i1 = find(subject_labels == uq_subjects(s));
+    
+    n_utt_per_talker(s) = length(i1);
+    
+    i2 = intersect(i1,ads_i);
+    i3 = intersect(i1,ids_i);
+    
+    SUBJ_STATS(n,:) = mean(UTT_STATS(i2,:));
+    SUBJ_STATS(n+1,:) = mean(UTT_STATS(i3,:));
+    am_data(n) = sum(utterance_lengths(i2));
+    am_data(n+1) = sum(utterance_lengths(i3));
+    
+    n = n+2;
+end
+
+SUBJ_STATS = [SUBJ_STATS am_data];
+
+% Apepend utterance-level stats also with the amount of samples behind each
+% probability estimate (on average)
+am_data_full = zeros(size(UTT_STATS,1),1);
+for k = 1:size(UTT_STATS,1)
+    i1 = find(SUBJ_STATS(:,1) == UTT_STATS(k,1));
+    i2 = find(SUBJ_STATS(:,end-1) == UTT_STATS(k,end));
+    i = intersect(i1,i2);
+    am_data_full(k) = SUBJ_STATS(i,end);
+end
+UTT_STATS = [UTT_STATS am_data_full];
+
+% Write utterance-level and subject-level stats to files
+
+headers = {'IDSADS','prob_var','prob_mean','prob_max','prob_min','prob_maxmin','F0_var','F0_mean','F0_max','F0_min','F0_maxmin','log_dur','babyID','amount_of_data'};
+commaHeader = [headers;repmat({','},1,numel(headers))]; %insert commaas
+commaHeader = commaHeader(:)';
+textHeader = cell2mat(commaHeader); %cHeader in text with commas
+fid = fopen('results/results_utterances.csv','w');
+fprintf(fid,'%s\n',textHeader);
+fclose(fid);
+dlmwrite('results/results_utterances.csv',UTT_STATS,'-append');
+
+
+headers = {'IDSADS','prob_var','prob_mean','prob_max','prob_min','prob_maxmin','F0_var','F0_mean','F0_max','F0_min','F0_maxmin','log_dur','babyID','amount_of_data'};
+commaHeader = [headers;repmat({','},1,numel(headers))]; %insert commaas
+commaHeader = commaHeader(:)';
+textHeader = cell2mat(commaHeader); %cHeader in text with commas
+fid = fopen('results/results_subjs.csv','w');
+fprintf(fid,'%s\n',textHeader);
+fclose(fid);
+dlmwrite('results/results_subjs.csv',SUBJ_STATS,'-append');
+
+% Normalize likelihoods by removing the predicted values from the amount of
+% matching training data
+
+SPSS_before_norm = UTT_STATS;
+D_before_norm = SUBJ_STATS;
+
+for f = 2:6
+    amount_of_data = UTT_STATS(:,end);
+    coeffs = polyfit(amount_of_data,UTT_STATS(:,f),1);
+    prediction = coeffs(1)*amount_of_data+coeffs(2);
+    UTT_STATS(:,f) = UTT_STATS(:,f)-prediction;
+    
+    amount_of_data = SUBJ_STATS(:,end);
+    coeffs = polyfit(amount_of_data,SUBJ_STATS(:,f),1);
+    prediction = coeffs(1)*amount_of_data+coeffs(2);
+    SUBJ_STATS(:,f) = SUBJ_STATS(:,f)-prediction;
+    
+end
+
+% Plot results
+
+pooledstats = 0; % Compare utterances instead of subject means? default = 0
+
+imaghandle = figure('Position',[200 200 587 569]);clf;
+subplot(3,1,1);
+
+if(~pooledstats)
+    bardata = [mean(D_before_norm(2:2:end,[3 2 4 5 6]))' mean(D_before_norm(1:2:end,[3 2 4 5 6]))'];
+    bardevs = [std(D_before_norm(2:2:end,[3 2 4 5 6]))' std(D_before_norm(1:2:end,[3 2 4 5 6]))'];
+    bardevs = bardevs./sqrt(size(D_before_norm,1)./2); % Get standard errors
+else
+    bardata = [mean(UTT_STATS(ids_i,[3 2 4 5 6]))' mean(UTT_STATS(ads_i,[3 2 4 5 6]))'];
+    bardevs = [std(UTT_STATS(ids_i,[3 2 4 5 6]))' std(UTT_STATS(ads_i,[3 2 4 5 6]))'];
+    bardevs(:,1) = bardevs(:,1)./sqrt(length(ids_i));
+    bardevs(:,2) = bardevs(:,2)./sqrt(length(ads_i));
+end
+bar(bardata);
+
+drawstds(imaghandle,1:5,bardata(:,1),bardevs(:,1),0.095,2,'red',-0.1375);
+drawstds(imaghandle,1:5,bardata(:,2),bardevs(:,2),0.095,2,'red',+0.1375);
+grid;
+set(gca,'XTickLabel',{'utt. mean','utt. SD','utt. max','utt. min','utt. range'});
+leg1 = legend({'IDS','ADS'},'Position',[0.8363 0.8733 0.1141 0.0653]);
+title('F0 predictability P(q_s|q_s_-_1, ..., q_s_-_m)');
+ylabel('likelihood');
+
+subplot(3,1,2);
+
+if(~pooledstats)
+    
+    bardata = [mean(SUBJ_STATS(2:2:end,[3 2 4 5 6]))' mean(SUBJ_STATS(1:2:end,[3 2 4 5 6]))'];
+    bardevs = [std(SUBJ_STATS(2:2:end,[3 2 4 5 6]))' std(SUBJ_STATS(1:2:end,[3 2 4 5 6]))'];
+    bardevs = bardevs./sqrt(size(SUBJ_STATS,1)./2); % Get standard errors
+else
+    bardata = [mean(UTT_STATS(ids_i,[3 2 4 5 6]))' mean(UTT_STATS(ads_i,[3 2 4 5 6]))'];
+    bardevs = [std(UTT_STATS(ids_i,[3 2 4 5 6]))' std(UTT_STATS(ads_i,[3 2 4 5 6]))'];
+    bardevs(:,1) = bardevs(:,1)./sqrt(length(ids_i));
+    bardevs(:,2) = bardevs(:,2)./sqrt(length(ads_i));
+end
+bar(bardata);
+
+drawstds(imaghandle,1:5,bardata(:,1),bardevs(:,1),0.095,2,'red',-0.1375);
+drawstds(imaghandle,1:5,bardata(:,2),bardevs(:,2),0.095,2,'red',+0.1375);
+grid;
+set(gca,'XTickLabel',{'utt. mean','utt. SD','utt. max','utt. min','utt. range'});
+leg2 = legend({'IDS','ADS'},'Position',[0.8410 0.5808 0.1141 0.0653]);
+title('F0 predictability after controlling for training data');
+ylabel('normalized likelihood');
+
+subplot(3,1,3);
+
+if(~pooledstats)
+    bardata = [mean(SUBJ_STATS(2:2:end,[3 2 4 5 6]+5))' mean(SUBJ_STATS(1:2:end,[3 2 4 5 6]+5))'];
+    bardevs = [std(SUBJ_STATS(2:2:end,[3 2 4 5 6]+5))' std(SUBJ_STATS(1:2:end,[3 2 4 5 6]+5))'];
+    bardevs = bardevs./sqrt(size(SUBJ_STATS,1)./2);
+else
+    bardata = [mean(UTT_STATS(ids_i,[3 2 4 5 6]+5))' mean(UTT_STATS(ads_i,[3 2 4 5 6]+5))'];
+    bardevs = [std(UTT_STATS(ids_i,[3 2 4 5 6]+5))' std(UTT_STATS(ads_i,[3 2 4 5 6]+5))'];
+    bardevs(:,1) = bardevs(:,1)./sqrt(length(ids_i));
+    bardevs(:,2) = bardevs(:,2)./sqrt(length(ads_i));
+end
+
+bar(bardata);
+
+drawstds(imaghandle,1:5,bardata(:,1),bardevs(:,1),0.095,2,'red',-0.1375);
+drawstds(imaghandle,1:5,bardata(:,2),bardevs(:,2),0.095,2,'red',+0.1375);
+grid;
+set(gca,'XTickLabel',{'F0 mean','F0 SD','F0 max','F0 min','F0 max-min'});
+leg3 = legend({'IDS','ADS'},'Position',[0.8427 0.2891 0.1141 0.0653]);
+
+title('standard F0 measures');
+ylabel('Hz');
+
+colormap([0.2 0.7 0.9;0.9 0.9 0.9])
+
+% Swap the order of mean and SD for visualization
+orderi = [3 2 4 5 6 8 7 9 10 11];
+
+% Do pair-wise ttests
+
+siglevel = 0.05/10; % Bonferroni normalized (not relevant, see below)
+x = 1;
+h = zeros(10,1);
+p = zeros(10,1);
+stats = cell(10,1);
+
+for f = orderi
+    
+    if(pooledstats)
+        i = find(UTT_STATS(:,1) == 0);
+        x_ads = UTT_STATS(i,f);
+        i = find(UTT_STATS(:,1) == 1);
+        x_ids = UTT_STATS(i,f);
+        [h(x),p(x),~,stats{x}] = ttest2(x_ads,x_ids,siglevel);
+    else
+        x_ads = SUBJ_STATS(1:2:end,f); % ADS values
+        x_ids = SUBJ_STATS(2:2:end,f); % IDS values
+        [h(x),p(x),~,stats{x}] = ttest(x_ads,x_ids,siglevel);
+    end
+    x = x+1;
+end
+
+% Correct significances to Holm-Bonferroni with the given p-values
+
+[siglevels,h] = holmBonferroni(p,0.05);
+
+% Update plots with markers for significant differences
+
+subplot(3,1,2);
+
+for k = 1:5
+    if(h(k)) % check if significant after correction
+        H = sigstar([k-0.125,k+0.125],0.03);
+        
+        v = get(H(1));
+        text(k,mean(v.YData)+0.02,sprintf('t = %0.2f',stats{k}.tstat),'HorizontalAlignment','center','FontSize',13);
+    end
+end
+ylim([-0.06 0.1])
+subplot(3,1,3);
+for k = 1:5
+    if(h(k+5))
+        H = sigstar([k-0.125,k+0.125],0.03);
+        
+        v = get(H(1));
+        text(k,mean(v.YData)+45,sprintf('t = %0.2f',stats{k+5}.tstat),'HorizontalAlignment','center','FontSize',13);
+    end
+end
+
+% End of plotting
+
+% Compare naming to non-naming
+
+nl_i = cellfind(METADATA(:,4),'N/A');
+fam_i = cellfind(METADATA(:,4),'familiar');
+unfam_i = cellfind(METADATA(:,4),'unfamiliar');
+
+% Get subject specific means
+
+nl_means = zeros(length(uq_subjects),1);
+fam_means = zeros(length(uq_subjects),1);
+unfam_means = zeros(length(uq_subjects),1);
+nl_means_ids = zeros(length(uq_subjects),1);
+fam_means_ids = zeros(length(uq_subjects),1);
+unfam_means_ids = zeros(length(uq_subjects),1);
+
+nl_var = zeros(length(uq_subjects),1);
+fam_var = zeros(length(uq_subjects),1);
+unfam_var = zeros(length(uq_subjects),1);
+nl_var_ids = zeros(length(uq_subjects),1);
+fam_var_ids = zeros(length(uq_subjects),1);
+unfam_var_ids = zeros(length(uq_subjects),1);
+
+nl_max = zeros(length(uq_subjects),1);
+fam_max = zeros(length(uq_subjects),1);
+unfam_max = zeros(length(uq_subjects),1);
+nl_max_ids = zeros(length(uq_subjects),1);
+fam_max_ids = zeros(length(uq_subjects),1);
+unfam_max_ids = zeros(length(uq_subjects),1);
+
+nl_maxmin = zeros(length(uq_subjects),1);
+fam_maxmin = zeros(length(uq_subjects),1);
+unfam_maxmin = zeros(length(uq_subjects),1);
+nl_maxmin_ids = zeros(length(uq_subjects),1);
+fam_maxmin_ids = zeros(length(uq_subjects),1);
+unfam_maxmin_ids = zeros(length(uq_subjects),1);
+
+
+for s = 1:length(uq_subjects)
+    i1 = find(subject_labels == uq_subjects(s));
+    nl_means(s) = mean(all_mean(intersect(nl_i,i1)));
+    fam_means(s) = mean(all_mean(intersect(fam_i,i1)));
+    unfam_means(s) = mean(all_mean(intersect(unfam_i,i1)));
+    nl_means_ids(s) = mean(all_mean(intersect(intersect(nl_i,i1),ids_i)));
+    fam_means_ids(s) = mean(all_mean(intersect(intersect(fam_i,i1),ids_i)));
+    unfam_means_ids(s) = mean(all_mean(intersect(intersect(unfam_i,i1),ids_i)));
+    
+    nl_var(s) = mean(all_SD(intersect(nl_i,i1)));
+    fam_var(s) = mean(all_SD(intersect(fam_i,i1)));
+    unfam_var(s) = mean(all_SD(intersect(unfam_i,i1)));
+    nl_var_ids(s) = mean(all_SD(intersect(intersect(nl_i,i1),ids_i)));
+    fam_var_ids(s) = mean(all_SD(intersect(intersect(fam_i,i1),ids_i)));
+    unfam_var_ids(s) = mean(all_SD(intersect(intersect(unfam_i,i1),ids_i)));
+    
+    nl_max(s) = mean(all_max(intersect(nl_i,i1)));
+    fam_max(s) = mean(all_max(intersect(fam_i,i1)));
+    unfam_max(s) = mean(all_max(intersect(unfam_i,i1)));
+    nl_max_ids(s) = mean(all_max(intersect(intersect(nl_i,i1),ids_i)));
+    fam_max_ids(s) = mean(all_max(intersect(intersect(fam_i,i1),ids_i)));
+    unfam_max_ids(s) = mean(all_max(intersect(intersect(unfam_i,i1),ids_i)));
+    
+    nl_maxmin(s) = mean(all_maxmin(intersect(nl_i,i1)));
+    fam_maxmin(s) = mean(all_maxmin(intersect(fam_i,i1)));
+    unfam_maxmin(s) = mean(all_maxmin(intersect(unfam_i,i1)));
+    nl_maxmin_ids(s) = mean(all_maxmin(intersect(intersect(nl_i,i1),ids_i)));
+    fam_maxmin_ids(s) = mean(all_maxmin(intersect(intersect(fam_i,i1),ids_i)));
+    unfam_maxmin_ids(s) = mean(all_maxmin(intersect(intersect(unfam_i,i1),ids_i)));
+end
+
+% Test if predictability of different talking styles differs (both IDS and
+% ADS pooled and only for IDS)
+
+siglevel = 0.05;
+
+h = zeros(18,1);
+p = zeros(18,1);
+
+[h(1),p(1)] = ttest(nl_means,fam_means,siglevel);
+[h(2),p(2)] = ttest(nl_means,unfam_means,siglevel);
+[h(3),p(3)] = ttest(unfam_means,fam_means,siglevel);
+
+[h(4),p(4)] = ttest(nl_max,fam_max,siglevel);
+[h(5),p(5)] = ttest(nl_max,unfam_max,siglevel);
+[h(6),p(6)] = ttest(unfam_max,fam_max,siglevel);
+
+[h(7),p(7)] = ttest(nl_maxmin,fam_maxmin,siglevel);
+[h(8),p(8)] = ttest(nl_maxmin,unfam_maxmin,siglevel);
+[h(9),p(9)] = ttest(unfam_maxmin,fam_maxmin,siglevel);
+
+[h(10),p(10)] = ttest(nl_means_ids,fam_means_ids,siglevel);
+[h(11),p(11)] = ttest(nl_means_ids,unfam_means_ids,siglevel);
+[h(12),p(12)] = ttest(unfam_means_ids,fam_means_ids,siglevel);
+
+[h(13),p(13)] = ttest(nl_max_ids,fam_max_ids,siglevel);
+[h(14),p(14)] = ttest(nl_max_ids,unfam_max_ids,siglevel);
+[h(15),p(15)] = ttest(unfam_max_ids,fam_max_ids,siglevel);
+
+[h(16),p(16)] = ttest(nl_maxmin_ids,fam_maxmin_ids,siglevel);
+[h(17),p(17)] = ttest(nl_maxmin_ids,unfam_maxmin_ids,siglevel);
+[h(18),p(18)] = ttest(unfam_maxmin_ids,fam_maxmin_ids,siglevel);
+
+[siglevels,h] = holmBonferroni(p,0.05);
+
+tmp = find(h); % anything significant?
+if(~isempty(tmp))
+    fprintf('Significant tests: ');
+    for j = 1:length(tmp)
+        fprintf('%d' ,tmp(j));
+    end
+    fprintf('.\n');
+else
+    fprintf('Utterance category differences are not significant.\n');
+end
+
+
+% Compare against typicality ratings (from https://osf.io/re95x/)
+
+load ADIDratings.mat
+
+% Get ratings and pair them with current data
+rating = ones(N,1).*NaN;
+for k = 1:length(filename1)
+    ff = filename1{k};
+    i = cellfind(filenames,ff);
+    rating(i) = HowIDorAD151AD5ID1(k);
+end
+
+a = find(~isnan(rating));
+a = intersect(ids_i,a);
+
+fprintf('Correlations w.r.t. human ratings on IDS-likeness:\n');
+for j = 2:11
+    [rho,p] = corr(SPSS_before_norm(a,j),rating(a),'type','Spearman');
+    fprintf('%s: r = %0.3f (p = %0.3f).\n',headers{j},rho,p); 
+end
