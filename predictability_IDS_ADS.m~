@@ -1,12 +1,9 @@
 % Scripts used to test intonation (F0) predictability on ManyBabies data 
 % (The ManyBabies Consortium, 2017; https://osf.io/re95x/)
-% as reported in Rasanen, O. Kakouros, S. & Soderstrom, M., 
-% "Connecting stimulus-driven attention to the properties of infant-directed
+% as reported in Rasanen, O. Kakouros, S. & Soderstrom, M. 
+% Connecting stimulus-driven attention to the properties of infant-directed
 % speech ? Is exaggerated intonation also more surprising?". Proceedings of
-% the 39th Annual Meeting of the Cognitive Science Society (CogSci-2017), 
-% London, UK, 2017.
-%
-% Please cite the above paper in any follow-ups from the present analyses.
+% the 39th Annual C
 %
 % Note: requires YAAPT (Zahorian & Hu, 2008;
 % http://ws2.binghamton.edu/zahorian/yaapt.htm) for F0 estimation. 
