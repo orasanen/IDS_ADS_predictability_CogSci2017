@@ -241,21 +241,15 @@ for iter = 1:n_repeats
         wloc_ids = 1;
         wloc_ads = 1;
         for j = 1:length(traininds)
-            k = traininds(orderi(j));  % index of the training utterance from the random order list
-            %len = length(F0PARAMS{orderi(k)});
-            len = length(F0PARAMS{k});
-            %allf0(wloc:wloc+len-1,:) = F0PARAMS{orderi(k)};
+            k = traininds(orderi(j));  % index of the training utterance from the random order list            
+            len = length(F0PARAMS{k});            
             allf0(wloc:wloc+len-1,:) = F0PARAMS{k};
             wloc = wloc+len;
             
-            if(sum(ids_i == k))
-                %allf0_ids = [allf0_ids;F0PARAMS{k}];
-                
+            if(sum(ids_i == k))                                
                 allf0_ids(wloc_ids:wloc_ids+len-1,:) = F0PARAMS{k};
-                wloc_ids = wloc_ids+len;
-                
-            elseif(sum(ads_i == k))
-                %allf0_ads = [allf0_ads;F0PARAMS{k}];
+                wloc_ids = wloc_ids+len;                
+            elseif(sum(ads_i == k))            
                 allf0_ads(wloc_ads:wloc_ads+len-1,:) = F0PARAMS{k};
                 wloc_ads = wloc_ads+len;
             else
