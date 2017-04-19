@@ -21,6 +21,7 @@
 %   - fixed some details of result image texts
 
 clear all
+ 
 
 % Parameters
 
